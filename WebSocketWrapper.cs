@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -11,19 +12,19 @@ namespace Coe.WebSocketWrapper
         private const int ReceiveChunkSize = 1024;
         private const int SendChunkSize = 1024;
 
-        private readonly ClientWebSocket _ws;
+        private ClientWebSocket _ws;
         private readonly Uri _uri;
         private readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
         private readonly CancellationToken _cancellationToken;
 
         private Action<WebSocketWrapper> _onConnected;
-        private Action<string, WebSocketWrapper> _onMessage;
+        private Action<Exception, WebSocketWrapper> _onConnectionError;
+        private Action<byte[], WebSocketWrapper> _onMessageBinary;
+        private Action<string, WebSocketWrapper> _onMessageString;
         private Action<WebSocketWrapper> _onDisconnected;
 
         protected WebSocketWrapper(string uri)
         {
-            _ws = new ClientWebSocket();
-            _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
             _uri = new Uri(uri);
             _cancellationToken = _cancellationTokenSource.Token;
         }
@@ -32,7 +33,7 @@ namespace Coe.WebSocketWrapper
         /// Creates a new instance.
         /// </summary>
         /// <param name="uri">The URI of the WebSocket server.</param>
-        /// <returns></returns>
+        /// <returns>Instance of the created WebSocketWrapper</returns>
         public static WebSocketWrapper Create(string uri)
         {
             return new WebSocketWrapper(uri);
@@ -41,18 +42,48 @@ namespace Coe.WebSocketWrapper
         /// <summary>
         /// Connects to the WebSocket server.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>Self</returns>
         public WebSocketWrapper Connect()
         {
+            if (_ws == null)
+            {
+                _ws = new ClientWebSocket();
+                _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+            }
+
             ConnectAsync();
             return this;
         }
 
         /// <summary>
+        /// Disconnects from the WebSocket server.
+        /// </summary>
+        /// <returns>Self</returns>
+        public WebSocketWrapper Disconnect()
+        {
+            DisconnectAsync();
+            return this;
+        }
+
+        /// <summary>
+        /// Get the current state of the WebSocket client.
+        /// </summary>
+        public WebSocketState State
+        {
+            get
+            {
+                if (_ws == null)
+                    return WebSocketState.None;
+
+                return _ws.State;
+            }
+        }
+
+        /// <summary>
         /// Set the Action to call when the connection has been established.
         /// </summary>
-        /// <param name="onConnect">The Action to call.</param>
-        /// <returns></returns>
+        /// <param name="onConnect">The Action to call</param>
+        /// <returns>Self</returns>
         public WebSocketWrapper OnConnect(Action<WebSocketWrapper> onConnect)
         {
             _onConnected = onConnect;
@@ -60,10 +91,21 @@ namespace Coe.WebSocketWrapper
         }
 
         /// <summary>
+        /// Set the Action to call when the connection fails.
+        /// </summary>
+        /// <param name="onConnectionError">The Action to call</param>
+        /// <returns>Self</returns>
+        public WebSocketWrapper OnConnectionError(Action<Exception, WebSocketWrapper> onConnectionError)
+        {
+            _onConnectionError = onConnectionError;
+            return this;
+        }
+
+        /// <summary>
         /// Set the Action to call when the connection has been terminated.
         /// </summary>
         /// <param name="onDisconnect">The Action to call</param>
-        /// <returns></returns>
+        /// <returns>Self</returns>
         public WebSocketWrapper OnDisconnect(Action<WebSocketWrapper> onDisconnect)
         {
             _onDisconnected = onDisconnect;
@@ -74,31 +116,50 @@ namespace Coe.WebSocketWrapper
         /// Set the Action to call when a messages has been received.
         /// </summary>
         /// <param name="onMessage">The Action to call.</param>
-        /// <returns></returns>
-        public WebSocketWrapper OnMessage(Action<string, WebSocketWrapper> onMessage)
+        /// <returns>Self</returns>
+        public WebSocketWrapper OnMessage(Action<byte[], WebSocketWrapper> onMessage)
         {
-            _onMessage = onMessage;
+            _onMessageBinary = onMessage;
             return this;
         }
 
         /// <summary>
-        /// Send a message to the WebSocket server.
+        /// Set the Action to call when a messages has been received.
+        /// </summary>
+        /// <param name="onMessage">The Action to call.</param>
+        /// <returns>Self</returns>
+        public WebSocketWrapper OnMessage(Action<string, WebSocketWrapper> onMessage)
+        {
+            _onMessageString = onMessage;
+            return this;
+        }
+
+        /// <summary>
+        /// Send a byte array to the WebSocket server.
+        /// </summary>
+        /// <param name="data">The data to send</param>
+        public void SendMessage(byte[] data)
+        {
+            SendMessageAsync(data);
+        }
+
+        /// <summary>
+        /// Send a UTF8 string to the WebSocket server.
         /// </summary>
         /// <param name="message">The message to send</param>
         public void SendMessage(string message)
         {
-            SendMessageAsync(message);
+            SendMessage(Encoding.UTF8.GetBytes(message));
         }
 
-        private async void SendMessageAsync(string message)
+        private async void SendMessageAsync(byte[] message)
         {
             if (_ws.State != WebSocketState.Open)
             {
                 throw new Exception("Connection is not open.");
             }
 
-            var messageBuffer = Encoding.UTF8.GetBytes(message);
-            var messagesCount = (int)Math.Ceiling((double)messageBuffer.Length / SendChunkSize);
+            var messagesCount = (int)Math.Ceiling((double)message.Length / SendChunkSize);
 
             for (var i = 0; i < messagesCount; i++)
             {
@@ -106,20 +167,41 @@ namespace Coe.WebSocketWrapper
                 var count = SendChunkSize;
                 var lastMessage = ((i + 1) == messagesCount);
 
-                if ((count * (i + 1)) > messageBuffer.Length)
+                if ((count * (i + 1)) > message.Length)
                 {
-                    count = messageBuffer.Length - offset;
+                    count = message.Length - offset;
                 }
 
-                await _ws.SendAsync(new ArraySegment<byte>(messageBuffer, offset, count), WebSocketMessageType.Text, lastMessage, _cancellationToken);
+                await _ws.SendAsync(new ArraySegment<byte>(message, offset, count), WebSocketMessageType.Text, lastMessage, _cancellationToken);
             }
         }
 
         private async void ConnectAsync()
         {
-            await _ws.ConnectAsync(_uri, _cancellationToken);
-            CallOnConnected();
-            StartListen();
+            try
+            {
+                await _ws.ConnectAsync(_uri, _cancellationToken);
+                CallOnConnected();
+                StartListen();
+            }
+            catch (Exception e)
+            {
+                _ws.Dispose();
+                _ws = null;
+                CallOnConnectionError(e);
+            }
+        }
+
+        private async void DisconnectAsync()
+        {
+            if (_ws != null)
+            {
+                if (_ws.State != WebSocketState.Open)
+                    await _ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
+                _ws.Dispose();
+                _ws = null;
+                CallOnDisconnected();
+            }
         }
 
         private async void StartListen()
@@ -130,8 +212,7 @@ namespace Coe.WebSocketWrapper
             {
                 while (_ws.State == WebSocketState.Open)
                 {
-                    var stringResult = new StringBuilder();
-
+                    byte[] byteResult = new byte[0];
 
                     WebSocketReceiveResult result;
                     do
@@ -140,37 +221,40 @@ namespace Coe.WebSocketWrapper
 
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
-                            await
-                                _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
-                            CallOnDisconnected();
+                            Disconnect();
                         }
                         else
                         {
-                            var str = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                            stringResult.Append(str);
+                            byteResult = byteResult.Concat(buffer.Take(result.Count)).ToArray();
                         }
 
                     } while (!result.EndOfMessage);
 
-                    CallOnMessage(stringResult);
-
+                    CallOnMessage(byteResult);
                 }
             }
-            catch (Exception)
+            catch (Exception e)
             {
-                CallOnDisconnected();
+                //CallOnDisconnected();
+                Disconnect();
             }
+/*
             finally
             {
                 _ws.Dispose();
             }
+*/
         }
 
-        private void CallOnMessage(StringBuilder stringResult)
+        private void CallOnMessage(byte[] result)
         {
-            if (_onMessage != null)
-                RunInTask(() => _onMessage(stringResult.ToString(), this));
+            if (_onMessageBinary != null)
+                RunInTask(() => _onMessageBinary(result, this));
+        
+            if (_onMessageString != null)
+                RunInTask(() => _onMessageString(Encoding.UTF8.GetString(result), this));
         }
+
 
         private void CallOnDisconnected()
         {
@@ -182,6 +266,14 @@ namespace Coe.WebSocketWrapper
         {
             if (_onConnected != null)
                 RunInTask(() => _onConnected(this));
+        }
+
+        private void CallOnConnectionError(Exception e)
+        {
+            if (_onConnectionError != null)
+                RunInTask(() => _onConnectionError(e, this));
+            else
+                throw e;
         }
 
         private static void RunInTask(Action action)
